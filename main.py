@@ -2,12 +2,22 @@ import os
 import json
 import uvicorn
 import google.generativeai as genai
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Form, Body
+from fastapi.responses import Response, JSONResponse
 from dotenv import load_dotenv
+from twilio.rest import Client
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel
 
 # Load environment variables from .env file
 load_dotenv()
+
+# --- Pydantic Models ---
+class TriggerCallRequest(BaseModel):
+    phone_number: Optional[str] = None
 
 # --- Configuration ---
 PORT = int(os.getenv("PORT", "8080"))
@@ -43,6 +53,28 @@ model = genai.GenerativeModel(
     system_instruction=SYSTEM_PROMPT
 )
 
+# --- Twilio Client Initialization for Outbound Calls ---
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")  # Your Twilio phone number
+TARGET_PHONE_NUMBER = os.getenv("TARGET_PHONE_NUMBER")  # Phone number to call
+
+if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]):
+    print("Warning: Twilio credentials not set. Outbound calling will be disabled.")
+    twilio_client = None
+else:
+    twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# --- Scheduler Configuration ---
+# CRON_SCHEDULE format: "minute hour day month day_of_week"
+# Examples:
+# - "0 9 * * *" = Every day at 9:00 AM
+# - "0 9,17 * * *" = Every day at 9:00 AM and 5:00 PM
+# - "0 9 * * 1-5" = Weekdays at 9:00 AM
+# - "*/30 * * * *" = Every 30 minutes
+CRON_SCHEDULE = os.getenv("CRON_SCHEDULE", "0 9 * * *")  # Default: Daily at 9 AM
+ENABLE_SCHEDULED_CALLS = os.getenv("ENABLE_SCHEDULED_CALLS", "false").lower() == "true"
+
 # Store active chat sessions
 # We will now store Gemini's chat session objects
 sessions = {}
@@ -50,10 +82,68 @@ sessions = {}
 # Create FastAPI app
 app = FastAPI()
 
+# Initialize scheduler
+scheduler = AsyncIOScheduler()
+
 async def gemini_response(chat_session, user_prompt):
     """Get a response from the Gemini API and stream it."""
     response = await chat_session.send_message_async(user_prompt)
     return response.text
+
+def make_outbound_call(to_phone_number=None):
+    """
+    Initiates an outbound call using Twilio.
+    
+    Args:
+        to_phone_number: The phone number to call. If None, uses TARGET_PHONE_NUMBER from env.
+    
+    Returns:
+        dict: Call details including call_sid
+    """
+    if not twilio_client:
+        print("Error: Twilio client not initialized. Check your credentials.")
+        return {"error": "Twilio client not configured"}
+    
+    target = to_phone_number or TARGET_PHONE_NUMBER
+    if not target:
+        print("Error: No target phone number specified.")
+        return {"error": "No target phone number specified"}
+    
+    try:
+        # The TwiML URL endpoint that Twilio will request to get instructions
+        twiml_url = f"https://{DOMAIN}/twiml"
+        
+        print(f"Initiating outbound call from {TWILIO_PHONE_NUMBER} to {target}")
+        
+        call = twilio_client.calls.create(
+            to=target,
+            from_=TWILIO_PHONE_NUMBER,
+            url=twiml_url,
+            status_callback=f"https://{DOMAIN}/call-status",
+            status_callback_event=["initiated", "ringing", "answered", "completed"]
+        )
+        
+        print(f"Call initiated successfully. SID: {call.sid}")
+        return {
+            "success": True,
+            "call_sid": call.sid,
+            "to": target,
+            "from": TWILIO_PHONE_NUMBER,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        print(f"Error making outbound call: {str(e)}")
+        return {"error": str(e)}
+
+def scheduled_call_job():
+    """Job function that gets called by the scheduler"""
+    print(f"[{datetime.now()}] Executing scheduled outbound call...")
+    result = make_outbound_call()
+    if result.get("success"):
+        print(f"Scheduled call completed: {result['call_sid']}")
+    else:
+        print(f"Scheduled call failed: {result.get('error')}")
 
 @app.post("/twiml")
 async def twiml_endpoint():
@@ -68,6 +158,81 @@ async def twiml_endpoint():
     </Response>"""
     
     return Response(content=xml_response, media_type="text/xml")
+
+@app.post("/call-status")
+async def call_status_callback(request: Request):
+    """Callback endpoint to track call status updates from Twilio"""
+    form_data = await request.form()
+    call_status = dict(form_data)
+    
+    # Log the important status information
+    call_sid = call_status.get('CallSid', 'Unknown')
+    status = call_status.get('CallStatus', 'Unknown')
+    print(f"Call status update - SID: {call_sid}, Status: {status}")
+    
+    return {"status": "received"}
+
+@app.post("/trigger-call")
+async def trigger_outbound_call(request: TriggerCallRequest = Body(default=TriggerCallRequest())):
+    """
+    Manual endpoint to trigger an outbound call.
+    
+    Usage:
+        POST /trigger-call
+        Optional JSON body: {"phone_number": "+1234567890"}
+    
+    If no phone_number is provided, uses TARGET_PHONE_NUMBER from environment.
+    """
+    if not twilio_client:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Twilio client not configured. Check your environment variables."}
+        )
+    
+    result = make_outbound_call(request.phone_number)
+    
+    if result.get("success"):
+        return JSONResponse(
+            status_code=200,
+            content=result
+        )
+    else:
+        return JSONResponse(
+            status_code=500,
+            content=result
+        )
+
+@app.get("/scheduler-status")
+async def scheduler_status():
+    """Check the status of the scheduler and view scheduled jobs"""
+    if not scheduler.running:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "scheduler_running": False,
+                "scheduled_calls_enabled": ENABLE_SCHEDULED_CALLS,
+                "message": "Scheduler is not running"
+            }
+        )
+    
+    jobs = []
+    for job in scheduler.get_jobs():
+        jobs.append({
+            "id": job.id,
+            "name": job.name,
+            "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+            "trigger": str(job.trigger)
+        })
+    
+    return JSONResponse(
+        status_code=200,
+        content={
+            "scheduler_running": True,
+            "scheduled_calls_enabled": ENABLE_SCHEDULED_CALLS,
+            "cron_schedule": CRON_SCHEDULE,
+            "jobs": jobs
+        }
+    )
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -121,6 +286,63 @@ async def websocket_endpoint(websocket: WebSocket):
         if call_sid in sessions:
             sessions.pop(call_sid)
             print(f"Cleared session for call {call_sid}")
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize scheduler on application startup"""
+    print("=" * 60)
+    print("Application Starting Up")
+    print("=" * 60)
+    print(f"Server Port: {PORT}")
+    print(f"Domain: {DOMAIN}")
+    print(f"WebSocket URL: {WS_URL}")
+    print(f"Twilio Client Configured: {'Yes' if twilio_client else 'No'}")
+    
+    if ENABLE_SCHEDULED_CALLS and twilio_client:
+        print(f"Scheduled Calls: ENABLED")
+        print(f"CRON Schedule: {CRON_SCHEDULE}")
+        print(f"Target Phone: {TARGET_PHONE_NUMBER or 'Not set'}")
+        
+        # Add the scheduled job
+        scheduler.add_job(
+            scheduled_call_job,
+            CronTrigger.from_crontab(CRON_SCHEDULE),
+            id="scheduled_outbound_call",
+            name="Scheduled Outbound Call",
+            replace_existing=True
+        )
+        
+        # Start the scheduler
+        scheduler.start()
+        print("Scheduler started successfully!")
+        
+        # Show next scheduled run
+        jobs = scheduler.get_jobs()
+        if jobs:
+            next_run = jobs[0].next_run_time
+            print(f"Next scheduled call: {next_run}")
+    else:
+        if not ENABLE_SCHEDULED_CALLS:
+            print("Scheduled Calls: DISABLED (Set ENABLE_SCHEDULED_CALLS=true to enable)")
+        else:
+            print("Scheduled Calls: DISABLED (Twilio client not configured)")
+    
+    print("=" * 60)
+    print("Server Ready!")
+    print("=" * 60)
+    print("\nEndpoints:")
+    print(f"  - TwiML: https://{DOMAIN}/twiml")
+    print(f"  - WebSocket: {WS_URL}")
+    print(f"  - Trigger Call: POST https://{DOMAIN}/trigger-call")
+    print(f"  - Scheduler Status: GET https://{DOMAIN}/scheduler-status")
+    print("=" * 60)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on application shutdown"""
+    if scheduler.running:
+        scheduler.shutdown()
+        print("Scheduler stopped")
 
 if __name__ == "__main__":
     print(f"Starting server on port {PORT}")
